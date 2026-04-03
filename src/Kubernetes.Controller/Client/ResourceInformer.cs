@@ -287,6 +287,24 @@ public abstract class ResourceInformer<TResource, TListResource> : BackgroundHos
             typeof(TResource).Name);
     }
 
+    private void OnWatchError(Exception error)
+    {
+        if (error is KubernetesException kubernetesError)
+        {
+            // deal with this non-recoverable condition "too old resource version"
+            if (string.Equals(kubernetesError.Status.Reason, "Expired", StringComparison.Ordinal))
+            {
+                throw error;
+            }
+        }
+
+        Logger.LogDebug(
+            EventId(EventType.IgnoringError),
+            "Ignoring error {ErrorType}: {ErrorMessage}",
+            error.GetType().Name,
+            error.Message);
+    }
+
     private async Task WatchAsync(CancellationToken cancellationToken)
     {
         Logger.LogInformation(
@@ -295,51 +313,55 @@ public abstract class ResourceInformer<TResource, TListResource> : BackgroundHos
             typeof(TResource).Name,
             _lastResourceVersion);
 
-        Action<Exception> onError = error =>
-        {
-            if (error is KubernetesException kubernetesError)
-            {
-                // deal with this non-recoverable condition "too old resource version"
-                if (string.Equals(kubernetesError.Status.Reason, "Expired", StringComparison.Ordinal))
-                {
-                    throw error;
-                }
-            }
-
-            Logger.LogDebug(
-                EventId(EventType.IgnoringError),
-                "Ignoring error {ErrorType}: {ErrorMessage}",
-                error.GetType().Name,
-                error.Message);
-        };
-
-        await foreach (var (watchEventType, item) in WatchResourceListAsync(resourceVersion: _lastResourceVersion,
-                           resourceSelector: _selector, onError: onError, cancellationToken: cancellationToken))
-        {
-            OnEvent(watchEventType, item);
-        }
-
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-
         var lastEventUtc = DateTime.UtcNow;
+        var lockObj = new object();
+
+        using var watchCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
         // reconnect if no events have arrived after a certain time
-        using var checkLastEventUtcTimer = new Timer(
+        await using var checkLastEventUtcTimer = new Timer(
             _ =>
             {
-                var lastEvent = DateTime.UtcNow - lastEventUtc;
+                DateTime currentLastEventUtc;
+                lock (lockObj)
+                {
+                    currentLastEventUtc = lastEventUtc;
+                }
+                var lastEvent = DateTime.UtcNow - currentLastEventUtc;
                 if (lastEvent > TimeSpan.FromMinutes(9.5))
                 {
-                    lastEventUtc = DateTime.MaxValue;
+                    lock (lockObj)
+                    {
+                        lastEventUtc = DateTime.MaxValue;
+                    }
                     Logger.LogDebug(
                         EventId(EventType.DisposingToReconnect),
                         "Disposing watcher for {ResourceType} to cause reconnect.",
                         typeof(TResource).Name);
+                    watchCts.Cancel();
                 }
             },
             state: null,
             dueTime: TimeSpan.FromSeconds(45),
             period: TimeSpan.FromSeconds(45));
+
+        try
+        {
+            await foreach (var (watchEventType, item) in WatchResourceListAsync(resourceVersion: _lastResourceVersion,
+                               resourceSelector: _selector, onError: OnWatchError, cancellationToken: watchCts.Token))
+            {
+                lock (lockObj)
+                {
+                    lastEventUtc = DateTime.UtcNow;
+                }
+
+                OnEvent(watchEventType, item);
+            }
+        }
+        catch (OperationCanceledException) when  (watchCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+
+        }
     }
 
     private void OnEvent(WatchEventType watchEventType, TResource item)
