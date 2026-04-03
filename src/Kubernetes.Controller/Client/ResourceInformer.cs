@@ -196,8 +196,13 @@ public abstract class ResourceInformer<TResource, TListResource> : BackgroundHos
         }
     }
 
-    protected abstract Task<HttpOperationResponse<TListResource>> RetrieveResourceListAsync(string resourceVersion = null, ResourceSelector<TResource> resourceSelector = null, CancellationToken cancellationToken = default);
-    protected abstract Watcher<TResource> WatchResourceListAsync(string resourceVersion = null, ResourceSelector<TResource> resourceSelector = null, Action<WatchEventType, TResource> onEvent = null, Action<Exception> onError = null, Action onClosed = null);
+    protected abstract Task<HttpOperationResponse<TListResource>> RetrieveResourceListAsync(
+        string resourceVersion = null, ResourceSelector<TResource> resourceSelector = null,
+        CancellationToken cancellationToken = default);
+
+    protected abstract IAsyncEnumerable<(WatchEventType, TResource)> WatchResourceListAsync(
+        string resourceVersion = null, ResourceSelector<TResource> resourceSelector = null,
+        Action<Exception> onError = null, CancellationToken cancellationToken = default);
 
     private static EventId EventId(EventType eventType) => new EventId((int)eventType, eventType.ToString());
 
@@ -290,42 +295,31 @@ public abstract class ResourceInformer<TResource, TListResource> : BackgroundHos
             typeof(TResource).Name,
             _lastResourceVersion);
 
-        // completion source helps turn OnClose callback into something awaitable
-        var watcherCompletionSource = new TaskCompletionSource<int>();
-
-        // begin watching where list left off
-        var watcher = WatchResourceListAsync(resourceVersion: _lastResourceVersion, resourceSelector: _selector,
-            (watchEventType, item) =>
+        Action<Exception> onError = error =>
+        {
+            if (error is KubernetesException kubernetesError)
             {
-                if (!watcherCompletionSource.Task.IsCompleted)
+                // deal with this non-recoverable condition "too old resource version"
+                if (string.Equals(kubernetesError.Status.Reason, "Expired", StringComparison.Ordinal))
                 {
-                    OnEvent(watchEventType, item);
+                    throw error;
                 }
-            },
-            error =>
-            {
-                if (error is KubernetesException kubernetesError)
-                {
-                    // deal with this non-recoverable condition "too old resource version"
-                    if (string.Equals(kubernetesError.Status.Reason, "Expired", StringComparison.Ordinal))
-                    {
-                        // cause this error to surface
-                        watcherCompletionSource.TrySetException(error);
-                        throw error;
-                    }
-                }
-
-                Logger.LogDebug(
-                    EventId(EventType.IgnoringError),
-                    "Ignoring error {ErrorType}: {ErrorMessage}",
-                    error.GetType().Name,
-                    error.Message);
-            },
-            () =>
-            {
-                watcherCompletionSource.TrySetResult(0);
             }
-        );
+
+            Logger.LogDebug(
+                EventId(EventType.IgnoringError),
+                "Ignoring error {ErrorType}: {ErrorMessage}",
+                error.GetType().Name,
+                error.Message);
+        };
+
+        await foreach (var (watchEventType, item) in WatchResourceListAsync(resourceVersion: _lastResourceVersion,
+                           resourceSelector: _selector, onError: onError, cancellationToken: cancellationToken))
+        {
+            OnEvent(watchEventType, item);
+        }
+
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
         var lastEventUtc = DateTime.UtcNow;
 
@@ -341,24 +335,11 @@ public abstract class ResourceInformer<TResource, TListResource> : BackgroundHos
                         EventId(EventType.DisposingToReconnect),
                         "Disposing watcher for {ResourceType} to cause reconnect.",
                         typeof(TResource).Name);
-
-                    watcherCompletionSource.TrySetCanceled();
-                    watcher.Dispose();
-
                 }
             },
             state: null,
             dueTime: TimeSpan.FromSeconds(45),
             period: TimeSpan.FromSeconds(45));
-
-        using var registration = cancellationToken.Register(watcher.Dispose);
-        try
-        {
-            await watcherCompletionSource.Task;
-        }
-        catch (TaskCanceledException)
-        {
-        }
     }
 
     private void OnEvent(WatchEventType watchEventType, TResource item)
